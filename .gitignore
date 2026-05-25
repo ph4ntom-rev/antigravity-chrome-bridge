@@ -1,0 +1,71 @@
+# Build artifacts
+build/
+build-*/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+CMakeUserPresets.json
+
+# Compiled objects
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Libraries
+*.so
+*.dylib
+*.dll
+*.so.*
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Chrome Extension packaging (sensitive!)
+*.crx
+*.pem
+
+# IDE / Editor
+.vs/
+*.user
+*.suo
+*.sln
+.vscode/
+.cache/
+.idea/
+cmake-build-*/
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Debug / logs
+err.txt
+*.log
+
+# Legacy artifacts
+legacy/output.txt
+legacy/lens_result.html
+legacy/__pycache__/

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 320px;
+      min-height: 400px;
+      font-family: 'Outfit', sans-serif;
+      background: radial-gradient(ellipse at top left, #1a1025 0%, #0f0f1a 60%, #0a0a14 100%);
+      color: #e2e8f0;
+      padding: 20px;
+      overflow-x: hidden;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ef4444;
+      flex-shrink: 0;
+      box-shadow: 0 0 6px #ef4444;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+
+    .dot.on {
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981, 0 0 20px rgba(16, 185, 129, 0.3);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 8px #10b981, 0 0 20px rgba(16, 185, 129, 0.3); }
+      50% { box-shadow: 0 0 12px #10b981, 0 0 30px rgba(16, 185, 129, 0.5); }
+    }
+
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      background: linear-gradient(135deg, #c084fc, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .panel {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 14px;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 12px;
+    }
+
+    .row:not(:last-child) {
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .row-label {
+      color: #94a3b8;
+      font-weight: 400;
+    }
+
+    .row-value {
+      font-weight: 500;
+      color: #e2e8f0;
+    }
+
+    #statusValue {
+      color: #ef4444;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      color: #64748b;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .cmd-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .cmd-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 10px;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 8px;
+      font-size: 11px;
+    }
+
+    .cmd-type {
+      color: #c084fc;
+      font-weight: 500;
+      font-family: 'Outfit', monospace;
+    }
+
+    .cmd-time {
+      color: #64748b;
+      font-size: 10px;
+    }
+
+    .cmd-empty {
+      color: #475569;
+      font-size: 11px;
+      text-align: center;
+      padding: 12px 0;
+    }
+
+    .error-section {
+      margin-bottom: 14px;
+      display: none;
+    }
+
+    .error-toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      color: #ef4444;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+      user-select: none;
+    }
+
+    .error-toggle .arrow {
+      font-size: 9px;
+      transition: transform 0.2s;
+    }
+
+    .error-toggle.open .arrow {
+      transform: rotate(90deg);
+    }
+
+    .error-body {
+      display: none;
+      padding: 10px;
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid rgba(239, 68, 68, 0.15);
+      border-radius: 8px;
+      font-size: 11px;
+      color: #fca5a5;
+      word-break: break-word;
+      font-family: monospace;
+    }
+
+    .error-body.open {
+      display: block;
+    }
+
+    .footer {
+      text-align: center;
+      font-size: 10px;
+      color: #334155;
+      letter-spacing: 0.5px;
+      padding-top: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="dot" id="dot"></div>
+    <div class="title">ANTIGRAVITY CHROME</div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <span class="row-label">Bridge Status</span>
+      <span class="row-value" id="statusValue">Offline</span>
+    </div>
+    <div class="row">
+      <span class="row-label">Active Mode</span>
+      <span class="row-value" id="modeValue">—</span>
+    </div>
+    <div class="row">
+      <span class="row-label">Uptime</span>
+      <span class="row-value" id="uptimeValue">—</span>
+    </div>
+    <div class="row">
+      <span class="row-label">Executed Commands</span>
+      <span class="row-value" id="cmdCountValue">0</span>
+    </div>
+  </div>
+
+  <div class="section-title">Recent Commands</div>
+  <div class="panel" id="cmdPanel">
+    <div class="cmd-empty" id="cmdEmpty">No commands yet</div>
+    <div class="cmd-list" id="cmdList"></div>
+  </div>
+
+  <div class="error-section" id="errorSection">
+    <div class="error-toggle" id="errorToggle">
+      <span class="arrow">▶</span>
+      <span>Last Error</span>
+    </div>
+    <div class="error-body" id="errorBody"></div>
+  </div>
+
+  <div class="footer">v2.0 · C++ Native Core</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
