@@ -1,367 +1,136 @@
 #include "ext_bridge.h"
 #include "config.h"
-#include "ws_client.h"
-#include <iostream>
-#include <sstream>
-#include <chrono>
+#include "security.h"
+#include <httplib.h>
 #include <algorithm>
+#include <stdexcept>
 
 namespace ag {
-
-ExtensionBridge::ExtensionBridge(const std::string& host, int port)
-    : host_(host), port_(port) {}
-
-ExtensionBridge::~ExtensionBridge() {
-    stop();
+static int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-
-std::string ExtensionBridge::generate_id() {
-    static int counter = 0;
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-    return "cmd_" + std::to_string(ms) + "_" + std::to_string(++counter);
+ExtensionBridge::ExtensionBridge(const std::string& host, int port, const std::string& token, const std::string& origin)
+    : host_(host), token_(token), origin_(origin), port_(port) {
+    if (host != "127.0.0.1" || port < 0 || port > 65535) throw std::invalid_argument("Extension server must use IPv4 loopback");
 }
-
+ExtensionBridge::~ExtensionBridge() { stop(); }
 void ExtensionBridge::start() {
-    if (running_.load()) return;
+    if (running_) return;
+    if (!valid_token(token_)) throw std::invalid_argument("A private 64-character token is required for extension mode");
+    const std::string prefix = "chrome-extension://";
+    if (!origin_.empty() && (origin_.size() != prefix.size() + 32 || origin_.compare(0, prefix.size(), prefix) != 0 ||
+        !std::all_of(origin_.begin() + prefix.size(), origin_.end(), [](char c) { return c >= 'a' && c <= 'p'; })))
+        throw std::invalid_argument("Specify the exact chrome-extension:// origin");
+    server_ = std::make_unique<httplib::Server>();
+    server_->new_task_queue = [] { return new httplib::ThreadPool(4, 4, 16); };
+    server_->set_payload_max_length(MAX_BODY_SIZE);
+    server_->set_read_timeout(3);
+    server_->set_write_timeout(3);
+    server_->set_keep_alive_max_count(1);
+    server_->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store");
+        auto reject = [&](int status, const char* message) {
+            res.status = status;
+            res.set_content(json({{"error", message}}).dump(), "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        };
+        auto host = req.get_header_value("Host");
+        if (req.get_header_value_count("Host") != 1 || (host != "127.0.0.1:" + std::to_string(port_) && host != "localhost:" + std::to_string(port_)))
+            return reject(403, "Invalid Host");
+        if (req.get_header_value_count("Origin") > 1 || (req.has_header("Origin") && (origin_.empty() || req.get_header_value("Origin") != origin_)))
+            return reject(403, "Origin not allowed");
+        if (req.has_header("Origin")) {
+            res.set_header("Access-Control-Allow-Origin", origin_);
+            res.set_header("Vary", "Origin");
+        }
+        if (req.method == "OPTIONS") {
+            if (!req.has_header("Origin")) return reject(403, "Origin required");
+            res.status = 204;
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        if (req.get_header_value_count("Authorization") != 1 || !constant_time_equal(req.get_header_value("Authorization"), "Bearer " + token_))
+            return reject(401, "Bearer authentication required");
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+    server_->Get("/api/ext/poll", [this](const auto&, auto& res) { res.set_content(poll().dump(), "application/json"); });
+    server_->Get("/api/ext/status", [this](const auto&, auto& res) {
+        res.set_content(json({{"connected", is_connected()}, {"commands_executed", commands_executed()}}).dump(), "application/json");
+    });
+    server_->Post("/api/ext/result", [this](const auto& req, auto& res) {
+        if (req.get_header_value("Content-Type").find("application/json") != 0) { res.status = 415; return; }
+        try {
+            auto result = resolve(json::parse(req.body));
+            if (result.contains("error")) res.status = 409;
+            res.set_content(result.dump(), "application/json");
+        } catch (const std::exception&) { res.status = 400; res.set_content("{\"error\":\"Invalid result object\"}", "application/json"); }
+    });
+    if (port_ == 0) port_ = server_->bind_to_any_port(host_);
+    else if (!server_->bind_to_port(host_, port_)) throw std::runtime_error("Extension port is already in use");
+    if (port_ <= 0) throw std::runtime_error("Cannot bind extension port");
     running_ = true;
-    server_thread_ = std::thread(&ExtensionBridge::server_loop, this);
-    std::cerr << "[Bridge] HTTP server starting on " << host_ << ":" << port_ << std::endl;
+    server_thread_ = std::thread([this] { server_->listen_after_bind(); });
+    server_->wait_until_ready();
 }
-
 void ExtensionBridge::stop() {
     running_ = false;
-    if (server_thread_.joinable()) {
-        server_thread_.join();
-    }
-}
-
-bool ExtensionBridge::is_connected() const {
-    int64_t last = last_poll_time_.load();
-    if (last == 0) return false;
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
-    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-    return (now_ms - last) < 3000;
-}
-
-json ExtensionBridge::submit(const std::string& cmd_type, const json& params, int timeout_ms) {
-    auto pending = std::make_shared<PendingCommand>();
-    pending->cmd.id = generate_id();
-    pending->cmd.type = cmd_type;
-    pending->cmd.params = params;
-    pending->completed = false;
-
     {
-        std::lock_guard<std::mutex> lock(queue_mtx_);
-        pending_queue_.push(pending);
-        pending_map_[pending->cmd.id] = pending;
-    }
-
-    // Wait for result
-    {
-        std::unique_lock<std::mutex> lock(pending->mtx);
-        bool ok = pending->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                                        [&] { return pending->completed; });
-        if (!ok) {
-            // Timeout — remove from map
-            std::lock_guard<std::mutex> qlock(queue_mtx_);
-            pending_map_.erase(pending->cmd.id);
-            return {{"error", "Chrome extension timeout — is it installed and active?"}};
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : pending_) {
+            entry.second->result = {{"error", "Bridge stopped"}, {"delivery_state", entry.second->dispatched ? "uncertain" : "not_delivered"}};
+            entry.second->completed = true;
+            entry.second->cv.notify_all();
         }
+        pending_.clear(); queue_.clear();
     }
-
-    commands_executed_++;
-
-    // Check for extension-side error
-    if (pending->result.is_object() && pending->result.contains("__error__")) {
-        return {{"error", pending->result["__error__"]}};
-    }
+    if (server_) server_->stop();
+    if (server_thread_.joinable()) server_thread_.join();
+    server_.reset(); last_poll_time_ = 0;
+}
+bool ExtensionBridge::is_connected() const { return running_ && last_poll_time_ != 0 && now_ms() - last_poll_time_ < 3000; }
+json ExtensionBridge::submit(const std::string& type, const json& params, int timeout_ms) {
+    if (!params.is_object() || timeout_ms <= 0 || timeout_ms > 60000) return {{"error", "Invalid command parameters"}};
+    auto pending = std::make_shared<PendingCommand>();
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!running_) return {{"error", "Extension mode is disabled"}, {"delivery_state", "not_delivered"}};
+    if (pending_.size() >= 64) return {{"error", "Extension queue is full"}, {"delivery_state", "not_delivered"}};
+    const auto id = std::to_string(++next_id_);
+    pending->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    pending->command = params;
+    pending->command["id"] = id; pending->command["type"] = type;
+    pending->command["deadline_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + timeout_ms;
+    pending_[id] = pending; queue_.push_back(id);
+    bool ok = pending->cv.wait_until(lock, pending->deadline, [&] { return pending->completed; });
+    pending_.erase(id);
+    queue_.erase(std::remove(queue_.begin(), queue_.end(), id), queue_.end());
+    if (!ok) return {{"error", "Extension result timed out; inspect state before retrying mutations"}, {"delivery_state", pending->dispatched ? "uncertain" : "not_delivered"}};
+    ++commands_executed_;
     return pending->result;
 }
-
-// ── HTTP Server ─────────────────────────────────────────────────────
-
-std::string ExtensionBridge::handle_poll() {
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
-    last_poll_time_ = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-
-    std::lock_guard<std::mutex> lock(queue_mtx_);
-    while (!pending_queue_.empty()) {
-        auto cmd = pending_queue_.front();
-        pending_queue_.pop();
-
-        // Skip if the command has already timed out (erased from map)
-        if (pending_map_.find(cmd->cmd.id) == pending_map_.end()) {
-            std::cerr << "[Bridge] Discarding timed-out command: " << cmd->cmd.type << std::endl;
-            continue;
-        }
-
-        json j = {
-            {"id", cmd->cmd.id},
-            {"type", cmd->cmd.type}
-        };
-        // Merge params into command
-        for (auto& [k, v] : cmd->cmd.params.items()) {
-            j[k] = v;
-        }
-        return json({{"command", j}}).dump();
+json ExtensionBridge::poll() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_poll_time_ = now_ms();
+    while (!queue_.empty()) {
+        auto id = queue_.front(); queue_.pop_front();
+        auto it = pending_.find(id);
+        if (it == pending_.end() || std::chrono::steady_clock::now() >= it->second->deadline) continue;
+        it->second->dispatched = true;
+        return {{"command", it->second->command}};
     }
-    return json({{"command", nullptr}}).dump();
+    return {{"command", nullptr}};
 }
-
-std::string ExtensionBridge::handle_result(const std::string& body) {
-    try {
-        json j = json::parse(body);
-        std::string cmd_id = j.value("id", "");
-
-        if (cmd_id.empty()) {
-            return json({{"error", "id required"}}).dump();
-        }
-
-        // Build the result: if error is present, wrap it; otherwise use result
-        json final_result;
-        if (j.contains("error") && !j["error"].is_null()) {
-            final_result = {{"__error__", j["error"]}};
-        } else if (j.contains("result") && !j["result"].is_null()) {
-            final_result = j["result"];
-        } else {
-            final_result = json::object();
-        }
-
-        std::lock_guard<std::mutex> lock(queue_mtx_);
-        auto it = pending_map_.find(cmd_id);
-        if (it != pending_map_.end()) {
-            auto pending = it->second;
-            {
-                std::lock_guard<std::mutex> plock(pending->mtx);
-                pending->result = final_result;
-                pending->completed = true;
-            }
-            pending->cv.notify_one();
-            pending_map_.erase(it);
-        }
-        return json({{"success", true}}).dump();
-    } catch (const std::exception& e) {
-        return json({{"error", e.what()}}).dump();
-    }
+json ExtensionBridge::resolve(const json& data) {
+    if (!data.is_object() || !data.contains("id") || !data["id"].is_string()) throw std::invalid_argument("Result ID required");
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = pending_.find(data["id"].get<std::string>());
+    if (it == pending_.end() || !it->second->dispatched || it->second->completed || std::chrono::steady_clock::now() >= it->second->deadline)
+        return {{"error", "Unknown, expired or completed command"}};
+    auto pending = it->second;
+    pending->result = data.contains("error") && !data["error"].is_null() ? json({{"error", data["error"]}}) : data.value("result", json::object());
+    if (pending->result.is_object() && pending->result.contains("__error__")) pending->result = {{"error", pending->result["__error__"]}};
+    pending->completed = true;
+    pending->cv.notify_all();
+    return {{"success", true}};
 }
-
-std::string ExtensionBridge::handle_status() {
-    return json({
-        {"connected", is_connected()},
-        {"commands_executed", commands_executed_.load()}
-    }).dump();
 }
-
-// ── Minimal HTTP Server (raw sockets) ───────────────────────────────
-
-void ExtensionBridge::server_loop() {
-    socket_t srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (srv == INVALID_SOCKET) {
-        std::cerr << "[Bridge] Failed to create socket." << std::endl;
-        return;
-    }
-
-    // SO_REUSEADDR
-    int opt = 1;
-#ifdef _WIN32
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-#else
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port_));
-    addr.sin_addr.s_addr = inet_addr(host_.c_str());
-
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        std::cerr << "[Bridge] Bind failed on port " << port_ << std::endl;
-        closesocket(srv);
-        return;
-    }
-
-    if (listen(srv, 16) == SOCKET_ERROR) {
-        std::cerr << "[Bridge] Listen failed." << std::endl;
-        closesocket(srv);
-        return;
-    }
-
-    std::cerr << "[Bridge] HTTP server ONLINE on http://" << host_ << ":" << port_ << std::endl;
-
-    // Set non-blocking with timeout for accept
-    while (running_.load()) {
-        // Use select for accept timeout
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(srv, &fds);
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 200000; // 200ms
-
-#ifdef _WIN32
-        int nfds = 0; // Ignored on Windows
-#else
-        int nfds = srv + 1;
-#endif
-        int sel = select(nfds, &fds, nullptr, nullptr, &tv);
-        if (sel <= 0) continue;
-
-        socket_t client = accept(srv, nullptr, nullptr);
-        if (client == INVALID_SOCKET) continue;
-
-        // Read HTTP request (Headers first, then parse Content-Length, then read body completely)
-        std::string req;
-        char temp_buf[4096];
-        size_t header_end = std::string::npos;
-
-        while (header_end == std::string::npos) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(client, &rfds);
-            struct timeval tv;
-            tv.tv_sec = 5; // 5 seconds timeout
-            tv.tv_usec = 0;
-#ifdef _WIN32
-            int select_nfds = 0;
-#else
-            int select_nfds = client + 1;
-#endif
-            int sel = select(select_nfds, &rfds, nullptr, nullptr, &tv);
-            if (sel <= 0) {
-                break;
-            }
-
-            int n = recv(client, temp_buf, sizeof(temp_buf), 0);
-            if (n <= 0) {
-                break;
-            }
-            req.append(temp_buf, n);
-            if (req.size() > 65536) {
-                break; // Header safety limit
-            }
-            header_end = req.find("\r\n\r\n");
-        }
-
-        if (header_end == std::string::npos) {
-            closesocket(client);
-            continue;
-        }
-
-        std::string headers = req.substr(0, header_end);
-        std::string body = req.substr(header_end + 4);
-
-        // Parse method and path
-        std::string method, path;
-        std::istringstream iss(headers);
-        iss >> method >> path;
-
-        // Extract Content-Length
-        size_t content_length = 0;
-        size_t cl_pos = headers.find("Content-Length:");
-        if (cl_pos == std::string::npos) {
-            cl_pos = headers.find("content-length:");
-        }
-        if (cl_pos != std::string::npos) {
-            size_t val_start = cl_pos + 15;
-            size_t val_end = headers.find("\r\n", val_start);
-            if (val_end != std::string::npos) {
-                std::string cl_str = headers.substr(val_start, val_end - val_start);
-                // trim whitespace
-                cl_str.erase(0, cl_str.find_first_not_of(" \t"));
-                if (cl_str.find_last_not_of(" \t") != std::string::npos) {
-                    cl_str.erase(cl_str.find_last_not_of(" \t") + 1);
-                }
-                try {
-                    content_length = std::stoull(cl_str);
-                } catch (...) {
-                    content_length = 0;
-                }
-            }
-        }
-
-        // If Content-Length exceeds limit, return 413
-        if (content_length > static_cast<size_t>(MAX_BODY_SIZE)) {
-            std::string resp = "HTTP/1.1 413 Payload Too Large\r\n"
-                               "Content-Type: application/json\r\n"
-                               "Connection: close\r\n\r\n"
-                               "{\"error\":\"Payload too large\"}";
-            send(client, resp.c_str(), (int)resp.size(), 0);
-            closesocket(client);
-            continue;
-        }
-
-        // Read the rest of the body
-        while (body.size() < content_length) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(client, &rfds);
-            struct timeval tv;
-            tv.tv_sec = 5;
-            tv.tv_usec = 0;
-#ifdef _WIN32
-            int select_nfds = 0;
-#else
-            int select_nfds = client + 1;
-#endif
-            int sel = select(select_nfds, &rfds, nullptr, nullptr, &tv);
-            if (sel <= 0) {
-                break;
-            }
-
-            size_t to_read = std::min(sizeof(temp_buf), content_length - body.size());
-            int n = recv(client, temp_buf, static_cast<int>(to_read), 0);
-            if (n <= 0) {
-                break;
-            }
-            body.append(temp_buf, n);
-        }
-
-        // Route
-        std::string response_body;
-        int status = 200;
-
-        if (method == "OPTIONS") {
-            // CORS preflight
-            std::string resp = "HTTP/1.1 204 No Content\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                "Access-Control-Allow-Headers: Content-Type\r\n"
-                "Content-Length: 0\r\n\r\n";
-            send(client, resp.c_str(), (int)resp.size(), 0);
-            closesocket(client);
-            continue;
-        } else if (method == "GET" && path == "/api/ext/poll") {
-            response_body = handle_poll();
-        } else if (method == "POST" && path == "/api/ext/result") {
-            response_body = handle_result(body);
-        } else if (method == "GET" && path == "/api/ext/status") {
-            response_body = handle_status();
-        } else {
-            response_body = json({{"error", "Not found: " + path}}).dump();
-            status = 404;
-        }
-
-        // Send HTTP response
-        std::string status_text = (status == 200) ? "OK" : "Not Found";
-        std::ostringstream resp;
-        resp << "HTTP/1.1 " << status << " " << status_text << "\r\n"
-             << "Content-Type: application/json; charset=utf-8\r\n"
-             << "Content-Length: " << response_body.size() << "\r\n"
-             << "Access-Control-Allow-Origin: *\r\n"
-             << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-             << "Access-Control-Allow-Headers: Content-Type\r\n"
-             << "Connection: close\r\n"
-             << "\r\n"
-             << response_body;
-
-        std::string full_resp = resp.str();
-        send(client, full_resp.c_str(), (int)full_resp.size(), 0);
-        closesocket(client);
-    }
-
-    closesocket(srv);
-    std::cerr << "[Bridge] HTTP server stopped." << std::endl;
-}
-
-} // namespace ag

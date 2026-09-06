@@ -6,7 +6,12 @@ let polling = false;
 let startTime = Date.now();
 let commandHistory = [];
 let commandCount = 0;
-let lastError = null;
+let lastError = 'Pairing required';
+let token = '';
+let connected = false;
+chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
+chrome.storage.local.get('bridgeToken').then(v => { token = v.bridgeToken || ''; });
+chrome.storage.onChanged.addListener(changes => { if (changes.bridgeToken) token = changes.bridgeToken.newValue || ''; });
 
 function addToHistory(type) {
   commandHistory.unshift({ type, timestamp: Date.now() });
@@ -18,13 +23,17 @@ function addToHistory(type) {
 
 async function postResult(id, result, error) {
   try {
-    await fetch(`${BRIDGE_URL}/api/ext/result`, {
+    const response = await fetch(`${BRIDGE_URL}/api/ext/result`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
       body: JSON.stringify({ id, result: result ?? null, error: error ?? null }),
     });
+    if (!response.ok) throw new Error(`Result rejected (${response.status}); inspect state before retrying`);
   } catch (e) {
-    console.error("[bridge] Failed to post result:", e);
+    lastError = e.message;
+    connected = false;
+    throw e;
   }
 }
 
@@ -33,6 +42,7 @@ async function handleCommand(cmd) {
   addToHistory(type);
 
   try {
+    if (!Number.isFinite(cmd.deadline_ms) || Date.now() >= cmd.deadline_ms) throw new Error("Command expired before execution");
     let result;
 
     switch (type) {
@@ -291,9 +301,13 @@ async function pollLoop() {
 
   while (true) {
     try {
+      if (!token) throw new Error("Pairing required");
       const resp = await fetch(`${BRIDGE_URL}/api/ext/poll`, {
-        signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(5000),
       });
+      if (!resp.ok) throw new Error(`Bridge rejected connection (${resp.status})`);
+      connected = true;
       if (resp.ok) {
       const data = await resp.json();
       const cmd = data.command;
@@ -303,6 +317,7 @@ async function pollLoop() {
         lastError = null;
       }
     } catch (e) {
+      connected = false;
       lastError = e.message;
     }
 
@@ -311,7 +326,7 @@ async function pollLoop() {
 }
 
 // Keepalive alarm
-chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
+chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
     // Keeps the service worker alive
@@ -322,7 +337,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "get_status") {
     sendResponse({
-      connected: lastError === null,
+      connected,
       startTime,
       commandCount,
       commandHistory: commandHistory.slice(0, 20),

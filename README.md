@@ -1,51 +1,47 @@
 # Antigravity Chrome Bridge
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
-[![MCP](https://img.shields.io/badge/MCP-2024--11--05-purple.svg)](https://modelcontextprotocol.io)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
+A C++17 MCP server with 22 Chrome automation tools over stdio. It connects to a dedicated Chrome debugging profile, or to a paired Manifest V3 extension. No Python or Node interpreter is needed to run the compiled server; builds use pinned nlohmann/json and cpp-httplib libraries.
 
-**Native C++ MCP server for Chrome automation — zero dependencies, instant startup, 22 tools.**
+## Start with a dedicated browser profile
 
-The only browser automation MCP server written in native C++. Single binary, no Node.js, no Python, no runtime dependencies. Works with any MCP client (Claude Desktop, Cursor, Antigravity, etc.)
+Launch Chrome with a separate profile and loopback remote debugging:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  antigravity-chrome-bridge.exe (~1.4MB)                     │
-│                                                             │
-│  ┌──── MCP Server (stdio JSON-RPC 2.0) ──── PRIMARY ────┐  │
-│  │  22 tools · 3 resources · auto-detection              │  │
-│  └───────────────────┬───────────────────┬───────────────┘  │
-│                      │                   │                  │
-│  ┌─── CDP Client ────┘  ┌── Ext Bridge ──┘                 │
-│  │ WebSocket → :9222    │ HTTP → :13371                     │
-│  └──────────────────┘   └──────────────────┘                │
-│                                                             │
-│  Language: C++17 · Libs: nlohmann/json (header-only)        │
-│  Build: CMake 3.20+ · Cross-platform                       │
-└─────────────────────────────────────────────────────────────┘
+```text
+chrome --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=/absolute/path/to/bridge-profile
 ```
 
----
+Configure your MCP client to launch the binary using stdio:
 
-## Why This Project?
+```json
+{"mcpServers":{"chrome":{"command":"/absolute/path/to/antigravity-chrome-bridge","args":[]}}}
+```
 
-Every existing Chrome MCP server is written in TypeScript or Python. This one is different:
+Use an absolute executable path (with `.exe` and escaped backslashes on Windows). The default launch opens no extension HTTP listener. CDP is a privileged browser interface without authentication; use a disposable profile and keep its port local.
 
-| | TypeScript MCP servers | **Antigravity Chrome Bridge** |
-|---|---|---|
-| **Startup** | ~800ms | **~5ms** |
-| **Memory** | ~40–80MB | **~5MB** |
-| **Tool call overhead** | ~15ms | **<1ms** |
-| **Binary size** | ~50MB (node_modules) | **~1.4MB** |
-| **Dependencies** | Node.js 18+ | **None** |
-| **Browser profile** | Isolated (Puppeteer) | **Real profile** (Extension mode) |
+## Pair the extension
 
----
+1. Load `chrome_extension/` as an unpacked extension in Chrome's extensions page. Copy its extension ID.
+2. Create a pairing file in a private directory outside the repository:
 
-## 🛠 22 MCP Tools
+   ```text
+   antigravity-chrome-bridge --init-token /absolute/private/path/bridge-token
+   ```
 
-All tools auto-detect the best backend (CDP → Extension fallback):
+   The file is created with owner-only permissions and is never overwritten. The secret is not printed.
+3. Open that file locally and paste its contents into the extension popup's pairing field. Save it. The extension stores the token in local storage restricted to trusted extension contexts.
+4. Add these arguments to the MCP client's server configuration:
+
+   ```json
+   ["--token-file","/absolute/private/path/bridge-token","--extension-id","your32characterextensionid"]
+   ```
+
+The server binds `127.0.0.1:13371`. Every operational HTTP route requires the bearer token; browser origins must match the configured extension exactly. The extension uses port 13371; the server's `--bridge-port` override is intended for custom clients and tests. `--cdp-port` changes the CDP destination.
+
+**Migration:** earlier releases accepted unauthenticated extension requests. Existing installations must pair the updated extension and configure the new arguments. To revoke a pairing, stop the server, create a new token file and pair again. Never share tokens, commit them or paste them into an issue.
+
+## Tools
+
+Backends prefer CDP when available, then the connected extension. Some operations require CDP.
 
 | Tool | Description |
 |------|-------------|
@@ -72,146 +68,24 @@ All tools auto-detect the best backend (CDP → Extension fallback):
 | `chrome_status` | Bridge status & diagnostics |
 | `chrome_batch` | Execute multiple commands in sequence |
 
----
 
-## 🚀 Quick Start
+`chrome_batch` prevalidates all commands (maximum 64, no nested batches), then stops at the first runtime error. Earlier browser changes remain; it is not a transaction. Tool failures set MCP `isError`, including failures returned by the extension.
 
-### Option A: Extension Bridge Mode (recommended)
+Extension commands expire after 10 seconds by default. `delivery_state: not_delivered` means a queued command was removed before dispatch. `uncertain` means dispatch happened but confirmation was lost: inspect the page before repeating a mutation. There is no automatic retry of a dispatched command. Expiration prevents a new execution from starting; it cannot undo or cancel browser work already in progress.
 
-Works on any Chrome profile without restarting Chrome.
+## Build and verify
 
-**1. Start the bridge:**
-```
-antigravity-chrome-bridge.exe
-```
+Requires CMake 3.20+, a C++17 compiler and network access for the two hash-pinned source archives. Windows builds target Windows 10+. Linux, Windows and macOS builds run in CI. Compiler/runtime libraries remain platform-specific; MinGW release builds link their runtime statically.
 
-**2. Install the extension:**
-1. Open `chrome://extensions/`
-2. Enable "Developer mode"
-3. Click "Load unpacked" → select `chrome_extension/` folder
-4. The popup should show "Connected" ✅
-
-### Option B: CDP Direct Mode
-
-For headless automation and full CDP access.
-
-**1. Start Chrome with debug port:**
-```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```text
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j4
+ctest --test-dir build -C Release --output-on-failure
+node tests/test_extension.js
 ```
 
-**2. Start the bridge:**
-```
-antigravity-chrome-bridge.exe
-```
-The bridge auto-detects CDP and connects directly.
+Python 3 is needed for tests and benchmarks; Node is needed only for extension tests. Use `-DBUILD_TESTING=OFF` for a build without the Python test dependency. For Ninja on Windows add `-G Ninja`. CTest checks authentication, protocol recovery, argument validation, extension result handling and queued/dispatched timeouts. If Chrome is installed, it also creates a temporary headless profile and exercises real DOM typing and clicking. Set `CHROME_BINARY` to its executable when discovery is unavailable. No existing profile is used. The extension tests simulate browser APIs; loading and pairing the extension in the Chrome UI remains a manual check.
 
----
+Transport limits include a 1 MiB stdio message, 10 MiB HTTP/WebSocket payload, bounded extension queue and HTTP workers, and finite network timeouts. HTTP/WebSocket parsing uses cpp-httplib rather than project-specific socket framing.
 
-## 🔌 MCP Configuration
-
-Add to your MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "chrome_bridge": {
-      "command": "/path/to/antigravity-chrome-bridge",
-      "args": []
-    }
-  }
-}
-```
-
----
-
-## 🏗 Building from Source
-
-### Prerequisites
-- CMake 3.20+
-- C++17 compiler (GCC 8+, Clang 7+, MSVC 2019+)
-
-### Linux / macOS
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-```
-
-### Windows (MSVC)
-```powershell
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-```
-
-### Cross-compile for Windows (WSL + MinGW)
-```bash
-bash build.sh
-```
-
-Output: `build-win64/antigravity-chrome-bridge.exe`
-
----
-
-## 🔧 Architecture
-
-The MCP protocol is the **native core** — not a wrapper around REST APIs.
-
-```
-AI Agent ←─ stdio JSON-RPC ─→ MCPServer
-                                  │
-                    ┌─────────────┼─────────────┐
-                    ▼                             ▼
-              CDPClient                    ExtensionBridge
-           (WebSocket:9222)              (HTTP Server:13371)
-                    │                             │
-                    ▼                             ▼
-              Chrome CDP                  Chrome Extension
-           (debug port)               (background.js polling)
-```
-
-**Two backends, one interface:**
-- **CDP mode** connects via WebSocket to Chrome's DevTools debug port. Supports PDF, device emulation, console logs.
-- **Extension mode** uses a Chrome Extension that polls an embedded HTTP server. Works with any Chrome profile without restart.
-
-Tools operate **directly** on CDP/Extension engines — zero intermediate HTTP hops within the process.
-
----
-
-## 📂 Project Structure
-
-```
-antigravity-chrome-bridge/
-├── src/
-│   ├── main.cpp           # Entry point: MCP stdio + HTTP bridge thread
-│   ├── mcp_core.h/cpp     # JSON-RPC 2.0 protocol engine
-│   ├── mcp_tools.h/cpp    # 22 tool definitions & handlers
-│   ├── mcp_resources.h/cpp # Live MCP resources
-│   ├── cdp_client.h/cpp   # Chrome DevTools Protocol WebSocket client
-│   ├── ext_bridge.h/cpp   # Extension HTTP bridge + command queue
-│   ├── ws_client.h/cpp    # Minimal RFC 6455 WebSocket client
-│   └── config.h           # Constants & configuration
-├── chrome_extension/
-│   ├── manifest.json      # Manifest V3
-│   ├── background.js      # Service worker (16 command handlers)
-│   ├── popup.html         # Glassmorphism status popup
-│   └── popup.js           # Popup state manager
-├── legacy/                # Archived Python v1
-├── CMakeLists.txt         # Build system
-├── build.sh               # WSL cross-compile script
-├── LICENSE                # Apache 2.0
-└── README.md
-```
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## 🔒 Security
-
-For security concerns, please see [SECURITY.md](SECURITY.md).
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
+See [benchmark methodology and local measurements](benchmarks/README.md), [security boundaries](SECURITY.md) and [third-party notices](THIRD_PARTY_NOTICES.md). The project is licensed under [Apache 2.0](LICENSE).

@@ -1,10 +1,19 @@
 {
   "manifest_version": 3,
   "name": "Antigravity Chrome Bridge",
-  "version": "2.0",
-  "description": "Full Chrome automation bridge — tab control, JS evaluation, DOM queries, screenshots, and more",
-  "permissions": ["tabs", "scripting", "activeTab", "alarms", "cookies"],
-  "host_permissions": ["<all_urls>"],
+  "version": "2.1.0",
+  "description": "Full Chrome automation bridge \u2014 tab control, JS evaluation, DOM queries, screenshots, and more",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "activeTab",
+    "alarms",
+    "cookies",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js"
   },

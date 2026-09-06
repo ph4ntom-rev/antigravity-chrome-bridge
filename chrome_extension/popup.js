@@ -58,7 +58,7 @@ function update(status) {
     recent.forEach((cmd) => {
       const item = document.createElement("div");
       item.className = "cmd-item";
-      item.innerHTML = `<span class="cmd-type">${cmd.type}</span><span class="cmd-time">${formatRelativeTime(cmd.timestamp)}</span>`;
+      item.textContent = `${cmd.type} — ${formatRelativeTime(cmd.timestamp)}`;
       cmdList.appendChild(item);
     });
   }
@@ -85,4 +85,16 @@ chrome.runtime.sendMessage({ type: "get_status" }, (response) => {
   if (response) {
     update(response);
   }
+});
+
+document.getElementById('pairSave').addEventListener('click', async () => {
+  const input = document.getElementById('pairToken');
+  const token = input.value.trim();
+  if (!/^[0-9a-f]{64}$/.test(token)) {
+    document.getElementById('pairStatus').textContent = 'Paste the 64-character token from your pairing file.';
+    return;
+  }
+  await chrome.storage.local.set({ bridgeToken: token });
+  input.value = '';
+  document.getElementById('pairStatus').textContent = 'Pairing saved. Reconnecting...';
 });
