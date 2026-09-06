@@ -1,35 +1,17 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+Report vulnerabilities using [private GitHub advisories](https://github.com/ph4ntom-rev/antigravity-chrome-bridge/security/advisories/new). Do not include browser cookies, pairing tokens or private page contents.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 2.0.x   | ✅ Yes             |
-| < 2.0   | ❌ No (legacy Python) |
+## Boundaries
 
-## Reporting a Vulnerability
+The stdio client is trusted and can execute JavaScript, access cookies, navigate pages and modify browser state. This is not a sandbox for untrusted prompts or web content. The extension has broad host permissions. Use a separate browser profile for automation where possible.
 
-If you discover a security vulnerability, please report it responsibly:
+The extension HTTP service is disabled unless a token file is configured. When enabled, it binds only to IPv4 loopback, validates Host, rejects unapproved browser Origins and requires a bearer token. CORS preflight exposes no commands and allows only the configured extension Origin. Pairing files are created with owner-only permissions; the extension uses trusted-context local storage. Local software running as the same account can access these credentials. Browser automation results may contain private data even though authentication and request bodies are not logged.
 
-1. **Do NOT** open a public issue
-2. Email: ph4ntom-rev@users.noreply.github.com
-3. Or use [GitHub Security Advisories](https://github.com/ph4ntom-rev/antigravity-chrome-bridge/security/advisories/new)
+CDP does not support this pairing token. Connections are restricted to the configured loopback port, including debugger WebSocket URLs received from discovery. Anyone able to access the Chrome debugging port can control that profile; never expose it to a network.
 
-## Security Considerations
+Requests, queues, payloads and waits have bounds, but arbitrary JavaScript may continue running inside Chrome after a timeout. A dispatched extension command with a missing result is reported as uncertain and must not be blindly retried. Batch operations are sequential with no rollback.
 
-### By Design
-- The bridge executes arbitrary JavaScript in browser tabs via `chrome_evaluate_js`
-- The extension has `<all_urls>` host permissions for full automation capability
-- The HTTP bridge server (`127.0.0.1:13371`) has no authentication (localhost-only)
+## Upgrade and revoke
 
-### Mitigations
-- All network listeners bind to `127.0.0.1` only (not `0.0.0.0`)
-- CDP connections are plaintext but localhost-only
-- Extension uses Manifest V3 service worker model
-- No secrets or credentials are stored or transmitted
-
-## Response Timeline
-
-- **Acknowledgment**: Within 48 hours
-- **Assessment**: Within 7 days
-- **Fix**: Depends on severity, typically within 30 days
+Use the paired extension protocol introduced by this change; older unauthenticated extension servers do not provide these protections. Stop the server before replacing the token file, then update the MCP configuration and extension pairing. Back up no token in a public repository. A compromised browser profile or operating-system account requires remediation outside this bridge.

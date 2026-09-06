@@ -69,3 +69,8 @@ err.txt
 legacy/output.txt
 legacy/lens_result.html
 legacy/__pycache__/
+
+# Local pairing secrets
+bridge-token
+bridge-token.*
+*.token

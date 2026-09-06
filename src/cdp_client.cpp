@@ -2,6 +2,8 @@
 #include <iostream>
 #include <sstream>
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
 
 namespace ag {
 
@@ -100,7 +102,12 @@ std::string CDPClient::find_ws_url(const std::string& tab_id) {
 json CDPClient::create_tab(const std::string& url) {
     try {
         // URL-encode the target URL for the query parameter
-        std::string path = "/json/new?" + url;
+        std::ostringstream encoded;
+        for (unsigned char c : url) {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') encoded << c;
+            else encoded << '%' << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+        }
+        std::string path = "/json/new?" + encoded.str();
         std::string body = http_put(host_, port_, path, 3000);
         if (body.empty()) {
             return json{{"error", "Empty response when creating tab"}};
@@ -163,6 +170,9 @@ json CDPClient::send_cdp_command(const std::string& tab_id, const std::string& m
         } catch (...) {}
     }
 
+    if (ws_host == "localhost") ws_host = "127.0.0.1";
+    if (ws_host != host_ || ws_port != port_ || ws_url.rfind("ws://", 0) != 0)
+        return json{{"error", "CDP advertised an unexpected WebSocket destination"}};
     WebSocketClient ws;
     if (!ws.connect(ws_host, ws_port, ws_path)) {
         return json{{"error", "Failed to connect WebSocket to " + ws_url}};
@@ -180,10 +190,11 @@ json CDPClient::send_cdp_command(const std::string& tab_id, const std::string& m
     }
 
     // Read responses until we get our matching id
-    for (int attempts = 0; attempts < 50; ++attempts) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (int attempts = 0; attempts < 50 && std::chrono::steady_clock::now() < deadline; ++attempts) {
         std::string response_text = ws.recv_text(10000);
         if (response_text.empty()) {
-            return json{{"error", "Empty response from CDP WebSocket"}};
+            return json{{"error", "CDP result unavailable; inspect state before retrying mutations"}};
         }
 
         try {

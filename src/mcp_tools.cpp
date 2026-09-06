@@ -14,7 +14,9 @@ static json text_result(const std::string& text) {
 }
 
 static json json_result(const json& data) {
-    return text_result(data.dump(2));
+    auto response = text_result(data.dump(2));
+    response["isError"] = data.is_object() && (data.contains("error") || (data.contains("success") && data["success"] == false));
+    return response;
 }
 
 static json error_result(const std::string& msg) {
@@ -75,11 +77,32 @@ json ToolRegistry::list_tools() const {
     return {{"tools", tools_arr}};
 }
 
+static std::string validate_arguments(const ToolDef& t, const json& arguments) {
+    if (!arguments.is_object()) return "Arguments must be an object";
+    for (const auto& param : t.params) {
+        if (!arguments.contains(param.name)) {
+            if (param.required) return "Missing required argument: " + param.name;
+            continue;
+        }
+        const auto& value = arguments[param.name];
+        const bool valid = (param.type == "string" && value.is_string()) ||
+            (param.type == "integer" && value.is_number_integer()) ||
+            (param.type == "number" && value.is_number()) ||
+            (param.type == "boolean" && value.is_boolean()) ||
+            (param.type == "array" && value.is_array()) ||
+            (param.type == "object" && value.is_object());
+        if (!valid) return "Invalid type for argument: " + param.name;
+    }
+    return "";
+}
+
 json ToolRegistry::call_tool(const std::string& name, const json& arguments) {
     std::lock_guard<std::mutex> lock(mtx_);
     for (auto& t : tools_) {
         if (t.name == name) {
             try {
+                const auto invalid = validate_arguments(t, arguments);
+                if (!invalid.empty()) return error_result(invalid);
                 return t.handler(arguments, cdp_, ext_);
             } catch (const std::exception& e) {
                 return error_result(e.what());
@@ -526,7 +549,7 @@ void ToolRegistry::register_all() {
     // ════════════════════════════════════════════════════════════════
     reg({"chrome_batch",
          "Execute multiple Chrome commands in sequence. Each command is a {tool, arguments} object. "
-         "Returns an array of results. Useful for complex multi-step automations.",
+         "Prevalidates up to 64 non-nested commands, then stops on the first error. Earlier effects are not rolled back.",
          {{"commands", "string", "JSON array of {tool, arguments} objects as a string", true}},
          [this](const json& args, CDPClient& cdp, ExtensionBridge& ext) -> json {
             std::string cmds_str = args.value("commands", "[]");
@@ -535,6 +558,20 @@ void ToolRegistry::register_all() {
                 return error_result("Invalid JSON in commands parameter");
             }
             if (!cmds.is_array()) return error_result("commands must be a JSON array");
+            if (cmds.size() > 64) return error_result("At most 64 commands are allowed");
+
+            // Validate the entire batch before any browser operation takes place.
+            for (const auto& cmd : cmds) {
+                if (!cmd.is_object() || !cmd.contains("tool") || !cmd["tool"].is_string())
+                    return error_result("Each command requires a string tool name");
+                const std::string name = cmd["tool"];
+                if (name == "chrome_batch") return error_result("Nested batches are not allowed");
+                const ToolDef* definition = nullptr;
+                for (const auto& t : tools_) if (t.name == name) definition = &t;
+                if (!definition) return error_result("Unknown tool: " + name);
+                const auto invalid = validate_arguments(*definition, cmd.value("arguments", json::object()));
+                if (!invalid.empty()) return error_result(name + ": " + invalid);
+            }
 
             json results = json::array();
             for (auto& cmd : cmds) {
@@ -553,6 +590,10 @@ void ToolRegistry::register_all() {
                     }
                 }
                 results.push_back(tool_result);
+                if (tool_result.value("isError", false))
+                    return json_result({{"success", false}, {"results", results},
+                        {"completed", results.size() - 1}, {"failed_index", results.size() - 1},
+                        {"error", "Batch stopped; earlier effects were not rolled back"}});
             }
             return json_result({{"results", results}, {"count", results.size()}});
          }});

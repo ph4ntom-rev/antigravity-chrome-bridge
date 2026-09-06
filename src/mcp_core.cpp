@@ -22,24 +22,28 @@ void MCPServer::run() {
 
 json MCPServer::read_message() {
     std::string line;
-    while (std::getline(std::cin, line)) {
-        // Skip empty lines
-        if (line.empty() || (line.size() == 1 && line[0] == '\r')) continue;
-        // Remove trailing \r if present
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-
-        try {
-            return json::parse(line);
-        } catch (const json::parse_error& e) {
-            std::cerr << "[MCP] JSON parse error: " << e.what() << std::endl;
-            std::cerr << "[MCP] Raw line: " << line.substr(0, 200) << std::endl;
-            // Send parse error response
-            json err = make_error(nullptr, -32700, "Parse error");
-            write_message(err);
+    char c;
+    bool oversized = false;
+    while (std::cin.get(c)) {
+        if (c != '\n') {
+            if (line.size() < 1024 * 1024) line += c;
+            else oversized = true;
+            continue;
         }
+        if (oversized) {
+            write_message(make_error(nullptr, -32600, "Request exceeds 1 MiB"));
+        } else if (!line.empty()) {
+            try {
+                auto value = json::parse(line);
+                if (!value.is_null()) return value;
+                write_message(make_error(nullptr, -32600, "Invalid Request"));
+            } catch (const json::parse_error&) {
+                write_message(make_error(nullptr, -32700, "Parse error"));
+            }
+        }
+        line.clear(); oversized = false;
     }
-    return nullptr; // EOF
+    return nullptr;
 }
 
 void MCPServer::write_message(const json& msg) {
@@ -49,7 +53,7 @@ void MCPServer::write_message(const json& msg) {
 
 void MCPServer::handle_message(const json& msg) {
     // Validate JSON-RPC 2.0
-    if (!msg.is_object()) {
+    if (!msg.is_object() || msg.value("jsonrpc", json()) != "2.0" || !msg.contains("method") || !msg["method"].is_string()) {
         write_message(make_error(nullptr, -32600, "Invalid Request: not an object"));
         return;
     }
@@ -58,6 +62,10 @@ void MCPServer::handle_message(const json& msg) {
     json id = msg.contains("id") ? msg["id"] : json(nullptr);
     json params = msg.value("params", json::object());
 
+    if (!params.is_object() || !(id.is_null() || id.is_string() || id.is_number_integer())) {
+        write_message(make_error(nullptr, -32600, "Invalid request parameters or ID"));
+        return;
+    }
     // Notifications (no id) — we just process and don't respond
     if (!msg.contains("id")) {
         if (method == "notifications/initialized") {
@@ -70,6 +78,7 @@ void MCPServer::handle_message(const json& msg) {
     }
 
     // Dispatch methods
+    try {
     json result;
     if (method == "initialize") {
         result = handle_initialize(params);
@@ -89,6 +98,9 @@ void MCPServer::handle_message(const json& msg) {
     }
 
     write_message(make_result(id, result));
+    } catch (const std::exception&) {
+        write_message(make_error(id, -32602, "Invalid parameters"));
+    }
 }
 
 json MCPServer::make_result(const json& id, const json& result) {

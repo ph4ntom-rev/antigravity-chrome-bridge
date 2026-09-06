@@ -1,4 +1,6 @@
 name: CI
+permissions:
+  contents: read
 
 on:
   push:
@@ -19,11 +21,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       - name: Build
         run: cmake --build build --config ${{ matrix.build_type }} -j4
+
+      - name: Protocol, security and browser checks
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Extension checks
+        run: |
+          node --check chrome_extension/background.js
+          node --check chrome_extension/popup.js
+          node tests/test_extension.js
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -32,3 +51,5 @@ jobs:
           path: |
             build/antigravity-chrome-bridge*
             build/Release/antigravity-chrome-bridge*
+            LICENSE
+            THIRD_PARTY_NOTICES.md
